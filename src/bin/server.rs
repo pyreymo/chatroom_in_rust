@@ -1,11 +1,15 @@
 use std::collections::HashMap;
+use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_channel::mpsc::{unbounded, UnboundedSender};
-use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
+use futures_util::{future, pin_mut, stream::TryStreamExt, SinkExt, StreamExt};
+use native_tls::{Identity, TlsAcceptor};
+use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio_native_tls::TlsAcceptor as TokioTlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 
 type Tx = UnboundedSender<Message>;
@@ -14,52 +18,97 @@ type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
 struct ChatServer {
     peer_map: PeerMap,
     addr: String,
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl ChatServer {
-    /// Create a new ChatServer instance
     pub fn new(addr: String) -> Self {
         ChatServer {
             peer_map: Arc::new(Mutex::new(HashMap::new())),
             addr,
+            tls_acceptor: None,
         }
     }
 
-    /// Start the chat server
+    pub fn with_tls_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Create certificate parameters
+        let mut params = CertificateParams::new(vec!["localhost".to_string()]);
+
+        // Set distinguished name
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "localhost");
+        dn.push(DnType::OrganizationName, "Chatroom Server");
+        dn.push(DnType::CountryName, "CN");
+        params.distinguished_name = dn;
+
+        // Generate certificate
+        let cert = Certificate::from_params(params)?;
+        let cert_pem = cert.serialize_pem()?;
+        let key_pem = cert.serialize_private_key_pem();
+
+        // Save certificate and key to files
+        fs::write("cert.pem", &cert_pem)?;
+        fs::write("key.pem", &key_pem)?;
+
+        // Create PKCS#12 identity
+        let identity = Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes())?;
+
+        // Create TLS acceptor
+        self.tls_acceptor = Some(TlsAcceptor::new(identity)?);
+        Ok(())
+    }
+
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(&self.addr).await?;
         println!("WebSocket server listening on: {}", self.addr);
 
         while let Ok((stream, addr)) = listener.accept().await {
             let peer_map = self.peer_map.clone();
-            tokio::spawn(Self::handle_connection(peer_map, stream, addr));
+            let tls_acceptor = self
+                .tls_acceptor
+                .as_ref()
+                .map(|acceptor| TokioTlsAcceptor::from(acceptor.clone()));
+
+            tokio::spawn(async move {
+                if let Some(acceptor) = tls_acceptor {
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => match tokio_tungstenite::accept_async(tls_stream).await {
+                            Ok(ws_stream) => {
+                                Self::handle_connection(peer_map, ws_stream, addr).await;
+                            }
+                            Err(e) => println!("Error during WebSocket handshake: {}", e),
+                        },
+                        Err(e) => println!("Error during TLS handshake: {}", e),
+                    }
+                } else {
+                    match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws_stream) => {
+                            Self::handle_connection(peer_map, ws_stream, addr).await;
+                        }
+                        Err(e) => println!("Error during WebSocket handshake: {}", e),
+                    }
+                }
+            });
         }
 
         Ok(())
     }
 
-    /// Handle an individual WebSocket connection
-    async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: SocketAddr) {
+    async fn handle_connection<S>(peer_map: PeerMap, ws_stream: S, addr: SocketAddr)
+    where
+        S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + SinkExt<Message>
+            + Unpin,
+        <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
+    {
         println!("Incoming TCP connection from: {}", addr);
 
-        let ws_stream = match tokio_tungstenite::accept_async(raw_stream).await {
-            Ok(ws_stream) => {
-                println!("WebSocket connection established with: {}", addr);
-                ws_stream
-            }
-            Err(e) => {
-                println!("Error during WebSocket handshake for {}: {}", addr, e);
-                return;
-            }
-        };
-
+        let (write, read) = ws_stream.split();
         let (tx, rx) = unbounded();
         peer_map.lock().await.insert(addr, tx);
 
-        let (outgoing, incoming) = ws_stream.split();
-
-        let broadcast_incoming = Self::handle_incoming_messages(peer_map.clone(), addr, incoming);
-        let receive_from_others = rx.map(Ok).forward(outgoing);
+        let broadcast_incoming = Self::handle_incoming_messages(peer_map.clone(), addr, read);
+        let receive_from_others = rx.map(Ok).forward(write);
 
         pin_mut!(broadcast_incoming, receive_from_others);
         match future::select(broadcast_incoming, receive_from_others).await {
@@ -79,7 +128,6 @@ impl ChatServer {
         peer_map.lock().await.remove(&addr);
     }
 
-    /// Handle incoming messages from a client
     async fn handle_incoming_messages(
         peer_map: PeerMap,
         addr: SocketAddr,
@@ -116,7 +164,14 @@ impl ChatServer {
 async fn main() {
     env_logger::init();
 
-    let server = ChatServer::new("127.0.0.1:8080".to_string());
+    let mut server = ChatServer::new("127.0.0.1:8080".to_string());
+
+    // Configure TLS
+    if let Err(e) = server.with_tls_config() {
+        eprintln!("Error configuring TLS: {}", e);
+        return;
+    }
+
     if let Err(e) = server.run().await {
         eprintln!("Error running server: {}", e);
     }
