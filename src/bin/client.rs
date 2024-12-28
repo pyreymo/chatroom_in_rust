@@ -61,8 +61,9 @@ impl ChatClient {
         let ws_stream = self.ws_stream.take().ok_or("Not connected to server")?;
         let (write, read) = ws_stream.split();
 
-        let stdin_handler = Self::handle_user_input(write);
-        let message_handler = Self::handle_server_messages(read);
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let stdin_handler = Self::handle_user_input(write, rx);
+        let message_handler = self.handle_server_messages(read, tx);
 
         pin_mut!(stdin_handler, message_handler);
         match future::select(stdin_handler, message_handler).await {
@@ -79,49 +80,70 @@ impl ChatClient {
         Ok(())
     }
 
-    async fn handle_user_input<S>(mut write: S) -> Result<(), Box<dyn Error>>
+    async fn handle_user_input<S>(
+        mut write: S,
+        messages: tokio::sync::mpsc::Receiver<String>,
+    ) -> Result<(), Box<dyn Error>>
     where
         S: SinkExt<Message> + Unpin,
         S::Error: Error + Send + Sync + 'static,
     {
         let mut stdin = BufReader::new(tokio::io::stdin());
         let mut line = String::new();
+        let mut messages = messages;
 
-        loop {
-            line.clear();
-            match stdin.read_line(&mut line).await {
-                Ok(n) if n == 0 || line.trim().is_empty() => break,
-                Ok(_) => {
-                    write
-                        .send(Message::Text(line.trim().to_string()))
-                        .await
-                        .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+        tokio::select! {
+            // 监听用户输入
+            _ = async {
+                loop {
+                    print!("> ");
+                    use std::io::{Write, stdout};
+                    stdout().flush().unwrap(); // 刷新提示符
+
+                    line.clear();
+                    match stdin.read_line(&mut line).await {
+                        Ok(n) if n == 0 || line.trim().is_empty() => {
+                            println!("Exiting input loop.");
+                            break;
+                        }
+                        Ok(_) => {
+                            write
+                                .send(Message::Text(line.trim().to_string()))
+                                .await
+                                .unwrap();
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading from stdin: {}", e);
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("Error reading from stdin: {}", e);
-                    break;
+            } => {},
+
+            // 监听消息接收
+            _ = async {
+                while let Some(msg) = messages.recv().await {
+                    println!("\r{}", msg); // 打印收到的消息并覆盖当前行
+                    print!("> "); // 恢复提示符
+                    use std::io::{Write, stdout};
+                    stdout().flush().unwrap(); // 刷新提示符
                 }
-            }
+            } => {}
         }
+
         Ok(())
     }
 
     async fn handle_server_messages(
-        read: impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+        &mut self,
+        mut read: impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+        sender: tokio::sync::mpsc::Sender<String>,
     ) {
-        read.for_each(|message| async {
-            match message {
-                Ok(msg) => {
-                    if let Message::Text(text) = msg {
-                        println!("Received: {}", text);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error receiving message: {}", e);
-                }
+        while let Some(message) = read.next().await {
+            if let Ok(Message::Text(text)) = message {
+                let _ = sender.send(text).await; // 发送给消息处理
             }
-        })
-        .await
+        }
     }
 }
 
@@ -135,7 +157,6 @@ async fn main() {
         }
     };
 
-    // Configure TLS to accept self-signed certificates
     if let Err(e) = client.with_tls_config(true) {
         eprintln!("Failed to configure TLS: {}", e);
         return;

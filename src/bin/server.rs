@@ -12,8 +12,8 @@ use tokio::sync::Mutex;
 use tokio_native_tls::TlsAcceptor as TokioTlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+use uuid::Uuid;
 
-// Custom error type
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error("IO error: {0}")]
@@ -22,15 +22,13 @@ pub enum ServerError {
     Tls(#[from] native_tls::Error),
     #[error("WebSocket error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
-    #[error("Send error: {0}")]
-    Send(String),
 }
 
 type Result<T> = std::result::Result<T, ServerError>;
 type Tx = UnboundedSender<Message>;
 type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
+type ClientIdMap = Arc<Mutex<HashMap<SocketAddr, String>>>;
 
-// Custom WebSocket stream enum to handle both TLS and non-TLS connections
 enum Stream {
     Plain(WebSocketStream<TcpStream>),
     Tls(WebSocketStream<tokio_native_tls::TlsStream<TcpStream>>),
@@ -45,7 +43,6 @@ impl Stream {
     }
 }
 
-// TLS configuration
 struct TlsConfig {
     acceptor: TlsAcceptor,
 }
@@ -79,15 +76,18 @@ impl TlsConfig {
     }
 }
 
-// Connection handler
 #[derive(Clone)]
 struct ConnectionHandler {
     peer_map: PeerMap,
+    client_ids: ClientIdMap,
 }
 
 impl ConnectionHandler {
     pub fn new(peer_map: PeerMap) -> Self {
-        Self { peer_map }
+        ConnectionHandler {
+            peer_map,
+            client_ids: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     async fn handle_connection<S>(&self, ws_stream: WebSocketStream<S>, addr: SocketAddr) -> Result<()>
@@ -97,11 +97,13 @@ impl ConnectionHandler {
             StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + SinkExt<Message>,
     {
         println!("New WebSocket connection: {}", addr);
+        let client_id = Uuid::new_v4().to_string();
+        let short_id = &client_id[0..8]; // 只使用前8位
+        self.client_ids.lock().await.insert(addr, client_id.clone());
         let (tx, rx) = unbounded();
         self.peer_map.lock().await.insert(addr, tx.clone());
 
-        // Send welcome message to the new client
-        let welcome_msg = Message::Text(format!("Welcome! You are connected from: {}", addr));
+        let welcome_msg = Message::Text(format!("Welcome! Your ID: {}", short_id));
         if let Err(e) = tx.unbounded_send(welcome_msg) {
             println!("Failed to send welcome message to {}: {}", addr, e);
         }
@@ -113,8 +115,9 @@ impl ConnectionHandler {
         pin_mut!(broadcast_incoming, receive_from_others);
         future::select(broadcast_incoming, receive_from_others).await;
 
-        println!("{} disconnected", &addr);
+        println!("{} disconnected", addr);
         self.peer_map.lock().await.remove(&addr);
+        self.client_ids.lock().await.remove(&addr);
         Ok(())
     }
 
@@ -123,19 +126,32 @@ impl ConnectionHandler {
         S: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
     {
         let peer_map = self.peer_map.clone();
+        let client_ids = self.client_ids.clone();
 
         while let Some(msg) = incoming.next().await {
-            let msg = msg.map_err(ServerError::WebSocket)?;
-            let msg_content = format!("Client {}: {}", addr, msg.to_text()?);
-            let broadcast_msg = Message::Text(msg_content);
+            match msg {
+                Ok(Message::Text(text)) => {
+                    let sender_id = match client_ids.lock().await.get(&addr) {
+                        Some(id) => id[0..8].to_string(), // 使用简短的ID
+                        None => continue,
+                    };
+                    println!("Received from {}: {}", sender_id, text); // 显示来源ID和消息内容
+                    let broadcast_msg = Message::Text(format!("{}: {}", sender_id, text));
 
-            let peers = peer_map.lock().await;
-            for peer in peers.iter() {
-                if *peer.0 != addr {
-                    if let Err(e) = peer.1.unbounded_send(broadcast_msg.clone()) {
-                        println!("Failed to send message to {}: {}", peer.0, e);
+                    let peers = peer_map.lock().await;
+                    for peer in peers.iter() {
+                        if *peer.0 != addr {
+                            if let Err(e) = peer.1.unbounded_send(broadcast_msg.clone()) {
+                                println!("Failed to send message to {}: {}", peer.0, e);
+                            }
+                        }
                     }
                 }
+                Ok(Message::Close(_)) => {
+                    println!("Client {} disconnected.", addr);
+                    break;
+                }
+                _ => {}
             }
         }
 
@@ -143,7 +159,6 @@ impl ConnectionHandler {
     }
 }
 
-// Main server struct
 struct ChatServer {
     peer_map: PeerMap,
     addr: String,
