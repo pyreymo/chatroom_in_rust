@@ -1,116 +1,123 @@
-// 导入标准库中的必要组件
-use std::collections::HashMap; // 用于存储连接的客户端
-use std::net::SocketAddr; // 用于表示网络地址
-use std::sync::Arc; // 用于共享所有权的智能指针
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-// 导入异步编程相关的依赖
-use futures_channel::mpsc::{unbounded, UnboundedSender}; // 用于异步消息通道
-use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt}; // 异步工具集
-use tokio::net::{TcpListener, TcpStream}; // 异步网络功能
-use tokio::sync::Mutex; // 异步互斥锁
-use tokio_tungstenite::tungstenite::Message; // WebSocket消息类型
+use futures_channel::mpsc::{unbounded, UnboundedSender};
+use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message;
 
-// 类型别名定义
-type Tx = UnboundedSender<Message>; // 消息发送器类型
-type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>; // 客户端连接映射表类型
+type Tx = UnboundedSender<Message>;
+type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
 
-/// 处理单个WebSocket连接的异步函数
-async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: SocketAddr) {
-    println!("Incoming TCP connection from: {}", addr);
+struct ChatServer {
+    peer_map: PeerMap,
+    addr: String,
+}
 
-    // 尝试将TCP连接升级为WebSocket连接
-    let ws_stream = match tokio_tungstenite::accept_async(raw_stream).await {
-        Ok(ws_stream) => {
-            println!("WebSocket connection established with: {}", addr);
-            ws_stream
+impl ChatServer {
+    /// Create a new ChatServer instance
+    pub fn new(addr: String) -> Self {
+        ChatServer {
+            peer_map: Arc::new(Mutex::new(HashMap::new())),
+            addr,
         }
-        Err(e) => {
-            println!("Error during WebSocket handshake for {}: {}", addr, e);
-            return;
+    }
+
+    /// Start the chat server
+    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(&self.addr).await?;
+        println!("WebSocket server listening on: {}", self.addr);
+
+        while let Ok((stream, addr)) = listener.accept().await {
+            let peer_map = self.peer_map.clone();
+            tokio::spawn(Self::handle_connection(peer_map, stream, addr));
         }
-    };
 
-    // 创建用于发送消息的通道
-    let (tx, rx) = unbounded();
-    // 将新连接的客户端添加到连接映射表中
-    peer_map.lock().await.insert(addr, tx);
+        Ok(())
+    }
 
-    // 将WebSocket流分割为发送和接收部分
-    let (outgoing, incoming) = ws_stream.split();
+    /// Handle an individual WebSocket connection
+    async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: SocketAddr) {
+        println!("Incoming TCP connection from: {}", addr);
 
-    // 处理接收到的消息并广播给其他客户端
-    let broadcast_incoming = {
-        let peer_map = peer_map.clone();
-        incoming.try_for_each(move |msg| {
-            let peer_map = peer_map.clone();
-            async move {
-                match msg.to_text() {
-                    Ok(text) => {
+        let ws_stream = match tokio_tungstenite::accept_async(raw_stream).await {
+            Ok(ws_stream) => {
+                println!("WebSocket connection established with: {}", addr);
+                ws_stream
+            }
+            Err(e) => {
+                println!("Error during WebSocket handshake for {}: {}", addr, e);
+                return;
+            }
+        };
+
+        let (tx, rx) = unbounded();
+        peer_map.lock().await.insert(addr, tx);
+
+        let (outgoing, incoming) = ws_stream.split();
+
+        let broadcast_incoming = Self::handle_incoming_messages(peer_map.clone(), addr, incoming);
+        let receive_from_others = rx.map(Ok).forward(outgoing);
+
+        pin_mut!(broadcast_incoming, receive_from_others);
+        match future::select(broadcast_incoming, receive_from_others).await {
+            future::Either::Left((result, _)) => {
+                if let Err(e) = result {
+                    println!("Error in broadcast_incoming for {}: {}", addr, e);
+                }
+            }
+            future::Either::Right((result, _)) => {
+                if let Err(e) = result {
+                    println!("Error in receive_from_others for {}: {}", addr, e);
+                }
+            }
+        }
+
+        println!("{} disconnected", &addr);
+        peer_map.lock().await.remove(&addr);
+    }
+
+    /// Handle incoming messages from a client
+    async fn handle_incoming_messages(
+        peer_map: PeerMap,
+        addr: SocketAddr,
+        incoming: impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+        incoming
+            .try_for_each(move |msg| {
+                let peer_map = peer_map.clone();
+                async move {
+                    if let Ok(text) = msg.to_text() {
                         println!("Received message from {}: {}", addr, text);
                         let peers = peer_map.lock().await;
 
-                        // 过滤出除发送者外的所有客户端
-                        let broadcast_recipients = peers
+                        let broadcast_recipients: Vec<_> = peers
                             .iter()
                             .filter(|(peer_addr, _)| peer_addr != &&addr)
-                            .map(|(_, ws_sink)| ws_sink);
+                            .map(|(_, ws_sink)| ws_sink)
+                            .collect();
 
-                        // 向所有其他客户端广播消息
                         for recp in broadcast_recipients {
                             if let Err(e) = recp.unbounded_send(msg.clone()) {
                                 println!("Error broadcasting message: {}", e);
                             }
                         }
                     }
-                    Err(e) => println!("Error processing message from {}: {}", addr, e),
+                    Ok(())
                 }
-                Ok(())
-            }
-        })
-    };
-
-    // 处理从其他客户端接收到的消息
-    let receive_from_others = rx.map(Ok).forward(outgoing);
-
-    // 同时处理消息的发送和接收
-    pin_mut!(broadcast_incoming, receive_from_others);
-    match future::select(broadcast_incoming, receive_from_others).await {
-        future::Either::Left((result, _)) => {
-            if let Err(e) = result {
-                println!("Error in broadcast_incoming for {}: {}", addr, e);
-            }
-        }
-        future::Either::Right((result, _)) => {
-            if let Err(e) = result {
-                println!("Error in receive_from_others for {}: {}", addr, e);
-            }
-        }
+            })
+            .await
     }
-
-    // 客户端断开连接时的清理工作
-    println!("{} disconnected", &addr);
-    peer_map.lock().await.remove(&addr);
 }
 
-/// 主函数：启动WebSocket服务器
 #[tokio::main]
 async fn main() {
-    // 初始化日志系统
     env_logger::init();
 
-    // 设置服务器监听地址
-    let addr = "127.0.0.1:8080";
-    // 创建用于存储所有客户端连接的共享状态
-    let state = PeerMap::new(Mutex::new(HashMap::new()));
-
-    // 绑定TCP监听器到指定地址
-    let try_socket = TcpListener::bind(&addr).await;
-    let listener = try_socket.expect("Failed to bind");
-    println!("Listening on: {}", addr);
-
-    // 持续接受新的连接请求
-    while let Ok((stream, addr)) = listener.accept().await {
-        // 为每个新连接创建一个新的任务
-        tokio::spawn(handle_connection(state.clone(), stream, addr));
+    let server = ChatServer::new("127.0.0.1:8080".to_string());
+    if let Err(e) = server.run().await {
+        eprintln!("Error running server: {}", e);
     }
 }
