@@ -113,6 +113,7 @@ dependencies = [
  "rcgen",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-native-tls",
  "tokio-tungstenite",

@@ -4,175 +4,222 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_channel::mpsc::{unbounded, UnboundedSender};
-use futures_util::{future, pin_mut, stream::TryStreamExt, SinkExt, StreamExt};
+use futures_util::{future, pin_mut, SinkExt, StreamExt};
 use native_tls::{Identity, TlsAcceptor};
 use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_native_tls::TlsAcceptor as TokioTlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 
+// Custom error type
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("TLS error: {0}")]
+    Tls(#[from] native_tls::Error),
+    #[error("WebSocket error: {0}")]
+    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error("Send error: {0}")]
+    Send(String),
+}
+
+type Result<T> = std::result::Result<T, ServerError>;
 type Tx = UnboundedSender<Message>;
 type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
 
-struct ChatServer {
-    peer_map: PeerMap,
-    addr: String,
-    tls_acceptor: Option<TlsAcceptor>,
+// Custom WebSocket stream enum to handle both TLS and non-TLS connections
+enum Stream {
+    Plain(WebSocketStream<TcpStream>),
+    Tls(WebSocketStream<tokio_native_tls::TlsStream<TcpStream>>),
 }
 
-impl ChatServer {
-    pub fn new(addr: String) -> Self {
-        ChatServer {
-            peer_map: Arc::new(Mutex::new(HashMap::new())),
-            addr,
-            tls_acceptor: None,
+impl Stream {
+    async fn handle_connection(self, handler: &ConnectionHandler, addr: SocketAddr) -> Result<()> {
+        match self {
+            Stream::Plain(ws_stream) => handler.handle_connection(ws_stream, addr).await,
+            Stream::Tls(ws_stream) => handler.handle_connection(ws_stream, addr).await,
         }
     }
+}
 
-    pub fn with_tls_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Create certificate parameters
+// TLS configuration
+struct TlsConfig {
+    acceptor: TlsAcceptor,
+}
+
+impl TlsConfig {
+    pub fn new() -> Result<Self> {
         let mut params = CertificateParams::new(vec!["localhost".to_string()]);
-
-        // Set distinguished name
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, "localhost");
         dn.push(DnType::OrganizationName, "Chatroom Server");
         dn.push(DnType::CountryName, "CN");
         params.distinguished_name = dn;
 
-        // Generate certificate
-        let cert = Certificate::from_params(params)?;
-        let cert_pem = cert.serialize_pem()?;
+        let cert = Certificate::from_params(params).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let cert_pem = cert
+            .serialize_pem()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let key_pem = cert.serialize_private_key_pem();
 
-        // Save certificate and key to files
         fs::write("cert.pem", &cert_pem)?;
         fs::write("key.pem", &key_pem)?;
 
-        // Create PKCS#12 identity
         let identity = Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes())?;
+        Ok(TlsConfig {
+            acceptor: TlsAcceptor::new(identity)?,
+        })
+    }
 
-        // Create TLS acceptor
-        self.tls_acceptor = Some(TlsAcceptor::new(identity)?);
+    pub fn get_acceptor(&self) -> TokioTlsAcceptor {
+        TokioTlsAcceptor::from(self.acceptor.clone())
+    }
+}
+
+// Connection handler
+#[derive(Clone)]
+struct ConnectionHandler {
+    peer_map: PeerMap,
+}
+
+impl ConnectionHandler {
+    pub fn new(peer_map: PeerMap) -> Self {
+        Self { peer_map }
+    }
+
+    async fn handle_connection<S>(&self, ws_stream: WebSocketStream<S>, addr: SocketAddr) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        WebSocketStream<S>:
+            StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + SinkExt<Message>,
+    {
+        println!("New WebSocket connection: {}", addr);
+        let (tx, rx) = unbounded();
+        self.peer_map.lock().await.insert(addr, tx.clone());
+
+        // Send welcome message to the new client
+        let welcome_msg = Message::Text(format!("Welcome! You are connected from: {}", addr));
+        if let Err(e) = tx.unbounded_send(welcome_msg) {
+            println!("Failed to send welcome message to {}: {}", addr, e);
+        }
+
+        let (outgoing, incoming) = ws_stream.split();
+        let broadcast_incoming = self.handle_incoming_messages(addr, incoming);
+        let receive_from_others = rx.map(Ok).forward(outgoing);
+
+        pin_mut!(broadcast_incoming, receive_from_others);
+        future::select(broadcast_incoming, receive_from_others).await;
+
+        println!("{} disconnected", &addr);
+        self.peer_map.lock().await.remove(&addr);
         Ok(())
     }
 
-    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_incoming_messages<S>(&self, addr: SocketAddr, mut incoming: S) -> Result<()>
+    where
+        S: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        let peer_map = self.peer_map.clone();
+
+        while let Some(msg) = incoming.next().await {
+            let msg = msg.map_err(ServerError::WebSocket)?;
+            let msg_content = format!("Client {}: {}", addr, msg.to_text()?);
+            let broadcast_msg = Message::Text(msg_content);
+
+            let peers = peer_map.lock().await;
+            for peer in peers.iter() {
+                if *peer.0 != addr {
+                    if let Err(e) = peer.1.unbounded_send(broadcast_msg.clone()) {
+                        println!("Failed to send message to {}: {}", peer.0, e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// Main server struct
+struct ChatServer {
+    peer_map: PeerMap,
+    addr: String,
+    tls_config: Option<TlsConfig>,
+}
+
+impl ChatServer {
+    pub fn new(addr: String) -> Self {
+        let peer_map = Arc::new(Mutex::new(HashMap::new()));
+        ChatServer {
+            peer_map,
+            addr,
+            tls_config: None,
+        }
+    }
+
+    pub fn enable_tls(&mut self) -> Result<()> {
+        self.tls_config = Some(TlsConfig::new()?);
+        Ok(())
+    }
+
+    pub async fn run(&self) -> Result<()> {
         let listener = TcpListener::bind(&self.addr).await?;
         println!("WebSocket server listening on: {}", self.addr);
 
         while let Ok((stream, addr)) = listener.accept().await {
-            let peer_map = self.peer_map.clone();
-            let tls_acceptor = self
-                .tls_acceptor
-                .as_ref()
-                .map(|acceptor| TokioTlsAcceptor::from(acceptor.clone()));
-
-            tokio::spawn(async move {
-                if let Some(acceptor) = tls_acceptor {
-                    match acceptor.accept(stream).await {
-                        Ok(tls_stream) => match tokio_tungstenite::accept_async(tls_stream).await {
-                            Ok(ws_stream) => {
-                                Self::handle_connection(peer_map, ws_stream, addr).await;
-                            }
-                            Err(e) => println!("Error during WebSocket handshake: {}", e),
-                        },
-                        Err(e) => println!("Error during TLS handshake: {}", e),
-                    }
-                } else {
-                    match tokio_tungstenite::accept_async(stream).await {
-                        Ok(ws_stream) => {
-                            Self::handle_connection(peer_map, ws_stream, addr).await;
-                        }
-                        Err(e) => println!("Error during WebSocket handshake: {}", e),
-                    }
-                }
-            });
+            let handler = ConnectionHandler::new(self.peer_map.clone());
+            let tls_config = self.tls_config.as_ref().map(|c| c.get_acceptor());
+            self.spawn_connection_handler(stream, addr, handler, tls_config);
         }
 
         Ok(())
     }
 
-    async fn handle_connection<S>(peer_map: PeerMap, ws_stream: S, addr: SocketAddr)
-    where
-        S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
-            + SinkExt<Message>
-            + Unpin,
-        <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
-    {
-        println!("Incoming TCP connection from: {}", addr);
-
-        let (write, read) = ws_stream.split();
-        let (tx, rx) = unbounded();
-        peer_map.lock().await.insert(addr, tx);
-
-        let broadcast_incoming = Self::handle_incoming_messages(peer_map.clone(), addr, read);
-        let receive_from_others = rx.map(Ok).forward(write);
-
-        pin_mut!(broadcast_incoming, receive_from_others);
-        match future::select(broadcast_incoming, receive_from_others).await {
-            future::Either::Left((result, _)) => {
-                if let Err(e) = result {
-                    println!("Error in broadcast_incoming for {}: {}", addr, e);
-                }
-            }
-            future::Either::Right((result, _)) => {
-                if let Err(e) = result {
-                    println!("Error in receive_from_others for {}: {}", addr, e);
-                }
-            }
-        }
-
-        println!("{} disconnected", &addr);
-        peer_map.lock().await.remove(&addr);
-    }
-
-    async fn handle_incoming_messages(
-        peer_map: PeerMap,
+    fn spawn_connection_handler(
+        &self,
+        stream: TcpStream,
         addr: SocketAddr,
-        incoming: impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-    ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-        incoming
-            .try_for_each(move |msg| {
-                let peer_map = peer_map.clone();
-                async move {
-                    if let Ok(text) = msg.to_text() {
-                        println!("Received message from {}: {}", addr, text);
-                        let peers = peer_map.lock().await;
-
-                        let broadcast_recipients: Vec<_> = peers
-                            .iter()
-                            .filter(|(peer_addr, _)| peer_addr != &&addr)
-                            .map(|(_, ws_sink)| ws_sink)
-                            .collect();
-
-                        for recp in broadcast_recipients {
-                            if let Err(e) = recp.unbounded_send(msg.clone()) {
-                                println!("Error broadcasting message: {}", e);
-                            }
+        handler: ConnectionHandler,
+        tls_acceptor: Option<TokioTlsAcceptor>,
+    ) {
+        tokio::spawn(async move {
+            let ws_stream = match tls_acceptor {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(tls_stream) => match tokio_tungstenite::accept_async(tls_stream).await {
+                        Ok(ws) => Stream::Tls(ws),
+                        Err(e) => {
+                            println!("Error during WebSocket handshake for TLS connection: {}", e);
+                            return;
                         }
+                    },
+                    Err(e) => {
+                        println!("Error during TLS handshake: {}", e);
+                        return;
                     }
-                    Ok(())
-                }
-            })
-            .await
+                },
+                None => match tokio_tungstenite::accept_async(stream).await {
+                    Ok(ws) => Stream::Plain(ws),
+                    Err(e) => {
+                        println!("Error during WebSocket handshake for plain connection: {}", e);
+                        return;
+                    }
+                },
+            };
+
+            match ws_stream.handle_connection(&handler, addr).await {
+                Ok(_) => (),
+                Err(e) => eprintln!("Error handling connection for {}: {}", addr, e),
+            }
+        });
     }
 }
 
 #[tokio::main]
-async fn main() {
-    env_logger::init();
-
+async fn main() -> Result<()> {
     let mut server = ChatServer::new("127.0.0.1:8080".to_string());
-
-    // Configure TLS
-    if let Err(e) = server.with_tls_config() {
-        eprintln!("Error configuring TLS: {}", e);
-        return;
-    }
-
-    if let Err(e) = server.run().await {
-        eprintln!("Error running server: {}", e);
-    }
+    server.enable_tls()?;
+    server.run().await
 }
