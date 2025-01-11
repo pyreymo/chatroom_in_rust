@@ -111,22 +111,7 @@ cargo run --bin client
 
 启动服务器和客户端后，终端中会显示如下内容：
 
-### 服务器输出：
-```
-WebSocket server listening on: 127.0.0.1:8080
-New WebSocket connection: 127.0.0.1:12345
-Received from <client_id>: Hello, World!
-Received from <another_client_id>: Hi there!
-Client 127.0.0.1:12345 disconnected.
-```
-
-### 客户端输出：
-```
-> Hello, World!
-> Hi there!
-> Goodbye!
-Exiting input loop.
-```
+![演示内容](image.png)
 
 ## 常见问题
 
